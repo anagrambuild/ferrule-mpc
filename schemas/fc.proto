@@ -1,0 +1,41 @@
+syntax = "proto3";
+package anagrambuild.ferrule;
+option go_package = "/schemas";
+
+message KeygenStart {
+  string sessionID = 1;
+}
+
+message KeygenMessage {
+  bytes from = 1;
+  bytes to = 2;
+  bool isBroadcast = 3;
+  bytes payload = 4;
+  uint32 round = 5;
+  string sessionID = 6;
+}
+
+message SignatureRequest {
+  bytes callData = 1;
+  // do we need abi here?
+}
+
+message Content {
+ oneof content {
+    KeygenStart keygenStart = 1;
+    KeygenMessage keygen = 2;
+    SignatureRequest signatureRequest = 3;
+  }
+}
+
+message ClusterMessage {
+  bytes id = 1;
+  optional bytes signature = 2;
+  bytes from = 3;
+  bool encrypted = 4;
+  optional bytes salt = 5;
+  optional bytes nonce = 6;
+  bytes content = 7;
+  //dont use this on the wire - only for internal use
+  optional Content parsedContent = 8;
+}

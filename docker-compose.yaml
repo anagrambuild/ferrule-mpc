@@ -1,0 +1,60 @@
+version: '3.3'
+services:
+  # farcaster with root export 
+  ferrule:
+    image: cosmtrek/air:latest
+    working_dir: /node/
+    ports:
+      - 9001:9000
+    expose:
+      - 7946/udp
+      - 7946/tcp
+    environment:
+      - FR_IDENTITY_KEY_PATH=/app/node.key
+      - FR_LOG_LEVEL=error
+      - GOLOG_LOG_LEVEL=error
+      - FR_DATA_DIR=/data/
+    volumes:
+      - ./nodedata/node/:/data/
+      - ./node.key:/app/node.key
+      - ./node/:/node/
+  ferrule2:
+    depends_on:
+      - ferrule
+    image: cosmtrek/air:latest
+    working_dir: /node/
+    expose:
+      - 7946/udp
+      - 7946/tcp
+    ports:
+      - 9000:9000
+    environment:
+      - FR_IDENTITY_KEY_PATH=/app/node2.key
+      - FR_LOG_LEVEL=error
+      - GOLOG_LOG_LEVEL=error
+      - FR_DATA_DIR=/data/
+      - FR_PEERS=ferrule
+    volumes:
+      - ./nodedata/node2/:/data/
+      - ./node2.key:/app/node2.key
+      - ./node/:/node/
+  ferrule3:
+    depends_on:
+      - ferrule
+    image: cosmtrek/air:latest
+    working_dir: /node/
+    expose:
+      - 7946/udp
+      - 7946/tcp
+    ports:
+      - 9002:9000
+    environment:
+      - FR_IDENTITY_KEY_PATH=/app/node3.key
+      - FR_LOG_LEVEL=error
+      - GOLOG_LOG_LEVEL=error
+      - FR_DATA_DIR=/data/
+      - FR_PEERS=ferrule
+    volumes:
+      - ./nodedata/node3/:/data/
+      - ./node3.key:/app/node3.key
+      - ./node/:/node/
