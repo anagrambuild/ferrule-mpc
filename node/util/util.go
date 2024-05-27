@@ -6,17 +6,21 @@ import (
 	"crypto/ecdsa"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"math/big"
 	"os"
 	"regexp"
 	"strconv"
+	"strings"
 	"sync"
+	"time"
 
 	"github.com/anagrambuild/ferrule/config"
 	ethcrypto "github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/crypto/secp256k1"
+	"github.com/ethereum/go-ethereum/ethclient"
 	"github.com/spf13/viper"
 	"golang.org/x/crypto/hkdf"
 )
@@ -50,7 +54,7 @@ func LoadIdentity(path string) *ecdsa.PrivateKey {
 func LoadSecretShare(loc string) []byte {
 	file, err := os.ReadFile(loc)
 	if err != nil {
-		fmt.Println("Error reading file")
+		fmt.Println("No secret share found, starting new committee.")
 		return nil
 	}
 	return file
@@ -62,30 +66,55 @@ type ConfigRaw struct {
 	Peers          []string `mapstructure:"PEERS"`
 	LogLevel       string   `mapstructure:"LOG_LEVEL"`
 	DataDir        string   `mapstructure:"DATA_DIR"`
+	OpUrl          string   `mapstructure:"OP_URL"`
 }
 
 func InitConfig() *config.FerruleConfig {
-	viper.SetEnvPrefix("fr")
+	viper.SetEnvPrefix("FR")
 	var cfg ConfigRaw
-	viper.BindEnv("IDENTITY_KEY_PATH")
-	viper.BindEnv("PEERS")
-	viper.BindEnv("LOG_LEVEL")
-	viper.BindEnv("DATA_DIR")
-	viper.BindEnv("SECRET_SHARE_DIR")
+	for _, env := range os.Environ() {
+		if strings.HasPrefix(env, "FR_") {
+			split := strings.Split(env, "=")
+			e := viper.BindEnv(strings.Replace(split[0], "FR_", "", 1))
+			if e != nil {
+				fmt.Println(e)
+			}
+		}
+	}
+	viper.AutomaticEnv()
 	viper.Unmarshal(&cfg)
+	client, err := ethclient.Dial(cfg.OpUrl)
+	if err != nil {
+		panic(err)
+	}
 	id := LoadIdentity(cfg.IdentityKpPath)
-	address := ethcrypto.PubkeyToAddress(id.PublicKey).Hex()
 	loc := cfg.SecretShareDir + "/current.json"
 	//todo peer encryption
 	return &config.FerruleConfig{
 		Identity:           id,
-		Address:            address,
+		NodeName:           PubKeyToNodeName(&id.PublicKey),
 		Peers:              cfg.Peers,
 		PeerEncryptionKey:  []byte{},
 		DataDir:            cfg.DataDir,
-		CurrentSecretShare: LoadSecretShare(cfg.SecretShareDir),
+		CurrentSecretShare: LoadSecretShare(loc),
 		CommitteeStateFile: loc,
+		ForkThreshold:      3,
+		OpClient:           client,
 	}
+}
+
+func NodeNameToPubKey(name string) (*ecdsa.PublicKey, error) {
+	decoded, err := hex.DecodeString(name)
+	if err != nil {
+		return nil, err
+	}
+	return ethcrypto.DecompressPubkey(decoded)
+}
+
+func PubKeyToNodeName(key *ecdsa.PublicKey) string {
+	compr := ethcrypto.CompressPubkey(key)
+	compressedKey := hex.EncodeToString(compr)
+	return compressedKey
 }
 
 func PrepareStorage(config config.FerruleConfig) {
@@ -247,4 +276,23 @@ func (s Set[T]) Items() []T {
 		items = append(items, item)
 	}
 	return items
+}
+
+func BackoffRetry(
+	fn func() error,
+	maxRetries int,
+	dur time.Duration,
+) error {
+	var err error
+	for i := 0; i < maxRetries; i++ {
+		err = fn()
+		if err == nil {
+			return nil
+		}
+		if i == maxRetries-1 {
+			return err
+		}
+		time.Sleep(dur)
+	}
+	return err
 }

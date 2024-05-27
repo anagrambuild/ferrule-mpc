@@ -4,6 +4,7 @@ services:
   ferrule:
     image: cosmtrek/air:latest
     working_dir: /node/
+    restart: always
     ports:
       - 9001:9000
     expose:
@@ -11,9 +12,10 @@ services:
       - 7946/tcp
     environment:
       - FR_IDENTITY_KEY_PATH=/app/node.key
-      - FR_LOG_LEVEL=error
-      - GOLOG_LOG_LEVEL=error
+      - FR_LOG_LEVEL=debug
+      - GOLOG_LOG_LEVEL=debug
       - FR_DATA_DIR=/data/
+      - FR_SECRET_SHARE_DIR=/data/scrt/
     volumes:
       - ./nodedata/node/:/data/
       - ./node.key:/app/node.key
@@ -30,10 +32,11 @@ services:
       - 9000:9000
     environment:
       - FR_IDENTITY_KEY_PATH=/app/node2.key
-      - FR_LOG_LEVEL=error
-      - GOLOG_LOG_LEVEL=error
+      - FR_LOG_LEVEL=debug
+      - GOLOG_LOG_LEVEL=debug
       - FR_DATA_DIR=/data/
       - FR_PEERS=ferrule
+      - FR_SECRET_SHARE_DIR=/data/scrt/
     volumes:
       - ./nodedata/node2/:/data/
       - ./node2.key:/app/node2.key
@@ -50,10 +53,11 @@ services:
       - 9002:9000
     environment:
       - FR_IDENTITY_KEY_PATH=/app/node3.key
-      - FR_LOG_LEVEL=error
-      - GOLOG_LOG_LEVEL=error
+      - FR_LOG_LEVEL=debug
+      - GOLOG_LOG_LEVEL=debug
       - FR_DATA_DIR=/data/
       - FR_PEERS=ferrule
+      - FR_SECRET_SHARE_DIR=/data/scrt/
     volumes:
       - ./nodedata/node3/:/data/
       - ./node3.key:/app/node3.key

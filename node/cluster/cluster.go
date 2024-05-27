@@ -1,19 +1,25 @@
 package cluster
 
 import (
-	"crypto/ecdh"
 	"crypto/ecdsa"
 	"errors"
+	"fmt"
+	"time"
+
+	"encoding/hex"
 
 	"github.com/anagrambuild/ferrule/config"
 	"github.com/anagrambuild/ferrule/schemas"
+	"github.com/anagrambuild/ferrule/util"
+	ethcrypto "github.com/ethereum/go-ethereum/crypto"
+	"github.com/ethereum/go-ethereum/crypto/ecies"
 	"github.com/hashicorp/memberlist"
-	"go.uber.org/zap"
+	"github.com/rs/zerolog/log"
 )
 
 type Self struct {
 	Identity *ecdsa.PrivateKey
-	ecdhKey  *ecdh.PrivateKey
+	encKey   *ecies.PrivateKey
 	Address  string
 	Node     *memberlist.Node
 }
@@ -48,7 +54,6 @@ type Cluster struct {
 	peers               []string
 	operator            *ClusterOperator
 	shutdown            chan struct{}
-	logger              *zap.Logger
 	messages            chan *schemas.ClusterMessage
 	events              chan memberlist.NodeEvent
 	listenerOpChan      chan ListenerOp
@@ -72,33 +77,29 @@ func (cl ClusterMsgBroadcast) Finished() {
 }
 
 func NewCluster(
-	cfg config.FerruleConfig,
+	cfg *config.FerruleConfig,
 ) *Cluster {
-	logger, _ := zap.NewProduction()
 	messages := make(chan *schemas.ClusterMessage)
 	events := make(chan memberlist.NodeEvent)
 	shutdown := make(chan struct{})
-	ecdh, err := cfg.Identity.ECDH()
-	if err != nil {
-		logger.Error("Failed to derive ecdh key", zap.Error(err))
-		panic(err)
-	}
+	eciesKey := ecies.ImportECDSA(cfg.Identity)
 	cluster := &Cluster{
 		self: &Self{
 			Identity: cfg.Identity,
-			Address:  cfg.Address,
-			ecdhKey:  ecdh,
+			Address:  cfg.NodeName,
+			encKey:   eciesKey,
 		},
 		peers:    cfg.Peers,
 		shutdown: shutdown,
-		logger:   logger,
 		operator: NewClusterOperator(
-			cfg.Address,
+			cfg.NodeName,
 			messages,
 			events,
 		),
-		messages: messages,
-		events:   events,
+		eventListenerOpChan: make(chan EventListenerOp),
+		listenerOpChan:      make(chan ListenerOp),
+		messages:            messages,
+		events:              events,
 		decoderFn: &ClusterMessageListener{
 			Id: "decoder",
 			Predicate: func(message *schemas.ClusterMessage) bool {
@@ -106,7 +107,7 @@ func NewCluster(
 			},
 			Listener: func(message *schemas.ClusterMessage) error {
 				if message.Encrypted {
-					err := message.Decrypt(ecdh)
+					err := message.Decrypt(eciesKey)
 					if err != nil {
 						return err
 					}
@@ -124,16 +125,29 @@ func NewCluster(
 }
 
 func (cl *Cluster) Start() error {
+	log.Info().Msg("Starting cluster")
+
+	go cl.recvMessages(cl.shutdown)
+	go cl.recvEvents(cl.shutdown)
 	err := cl.operator.Start()
 	if err != nil {
 		return err
 	}
-	go cl.recvMessages()
-	go cl.recvEvents()
-	_, err = cl.operator.Memberlist.Join(cl.peers)
-	if err != nil {
-		return err
+	log.Info().Msg("Started cluster")
+	if !cl.Head() {
+		err := util.BackoffRetry(
+			func() error {
+				_, err = cl.operator.Memberlist.Join(cl.peers)
+				return err
+			},
+			5,
+			time.Duration(5)*time.Second,
+		)
+		if err != nil {
+			return err
+		}
 	}
+
 	return nil
 }
 
@@ -146,7 +160,7 @@ func validateMessage(
 	if message.Id == nil || len(message.Id) == 0 {
 		return errors.New("missing id field in message")
 	}
-	if message.From == nil || len(message.From) == 0 {
+	if message.From == "" {
 		return errors.New("missing from field in message")
 	}
 	if message.Encrypted && (message.Salt == nil || message.Nonce == nil || len(message.Salt) == 0 || len(message.Nonce) == 0) {
@@ -154,14 +168,30 @@ func validateMessage(
 	} else if !message.Encrypted && (message.Signature == nil || len(message.Signature) == 0) {
 		return errors.New("missing signature for message")
 	}
+	if message.Content == nil && message.ParsedContent != nil {
+		return errors.New("message content must be encoded")
+	}
+	if message.Content == nil && message.ParsedContent == nil {
+		return errors.New("message content is nil")
+	}
 	return nil
 }
 
 func (cl *Cluster) Broadcast(message *schemas.ClusterMessage) error {
-	if err := validateMessage(message); err != nil {
+	err := message.EncodeContent()
+	if err != nil {
 		return err
 	}
-	message.EncodeContent()
+	err = message.Sign(cl.self.Identity)
+	if err != nil {
+		return err
+	}
+
+	if err := validateMessage(message); err != nil {
+		fmt.Println("error validating message", err)
+		return err
+	}
+	log.Debug().Any("message", message).Msg("Broadcasting message")
 	bts, err := schemas.EncodeClusterMessage(message)
 	if err != nil {
 		return err
@@ -173,10 +203,42 @@ func (cl *Cluster) Broadcast(message *schemas.ClusterMessage) error {
 }
 
 func (cl *Cluster) SendToNode(node *memberlist.Node, message *schemas.ClusterMessage) error {
+	err := message.EncodeContent()
+	if err != nil {
+		return err
+	}
+	if message.Encrypted {
+		message.Encrypted = false
+	}
+	err = message.Sign(cl.self.Identity)
 	if err := validateMessage(message); err != nil {
 		return err
 	}
-	message.EncodeContent()
+	bytes, err := schemas.EncodeClusterMessage(message)
+	if err != nil {
+		return err
+	}
+	return cl.operator.Memberlist.SendReliable(node, bytes)
+}
+
+func (cl *Cluster) SendToNodeEncrypted(node *memberlist.Node, message *schemas.ClusterMessage) error {
+	err := message.EncodeContent()
+	if err != nil {
+		return err
+	}
+	eciesPubKey, err := getEciesPubKey(node)
+	if err != nil {
+		return err
+	}
+	err = message.Encrypt(
+		cl.self.Identity,
+		cl.self.encKey, eciesPubKey)
+	if err != nil {
+		return err
+	}
+	if err := validateMessage(message); err != nil {
+		return err
+	}
 	bytes, err := schemas.EncodeClusterMessage(message)
 	if err != nil {
 		return err
@@ -185,7 +247,7 @@ func (cl *Cluster) SendToNode(node *memberlist.Node, message *schemas.ClusterMes
 }
 
 func (cl *Cluster) Shutdown() {
-	cl.shutdown <- struct{}{}
+	close(cl.shutdown)
 }
 
 func (cl *Cluster) SelfNode() *memberlist.Node {
@@ -231,10 +293,16 @@ func (cl *Cluster) RemoveListener(listener *ClusterMessageListener) {
 	}
 }
 
-func (cl *Cluster) recvEvents() {
+func (cl *Cluster) recvEvents(
+	shutdown chan struct{},
+) {
 	listeners := []ClusterEventListener{}
 	for {
 		select {
+		case <-shutdown:
+			{
+				return
+			}
 		case levent := <-cl.eventListenerOpChan:
 			{
 				switch levent.Op {
@@ -255,8 +323,6 @@ func (cl *Cluster) recvEvents() {
 					}
 				}
 			}
-		case <-cl.shutdown:
-			return
 		case event := <-cl.events:
 			for _, listener := range listeners {
 				go listener.Listener(event)
@@ -265,12 +331,34 @@ func (cl *Cluster) recvEvents() {
 	}
 }
 
-func (cl *Cluster) recvMessages() {
+func getEciesPubKey(
+	node *memberlist.Node,
+) (*ecies.PublicKey, error) {
+	pubkey := node.Name
+	hex, err := hex.DecodeString(pubkey)
+	if err != nil {
+		return nil, err
+	}
+	pub, err := ethcrypto.UnmarshalPubkey(hex)
+	if err != nil {
+		return nil, err
+	}
+	ePub := ecies.ImportECDSAPublic(pub)
+	return ePub, nil
+}
+
+func (cl *Cluster) recvMessages(
+	shutdown chan struct{},
+) {
 	listeners := []ClusterMessageListener{
 		*cl.decoderFn,
 	}
 	for {
 		select {
+		case <-shutdown:
+			{
+				return
+			}
 		case levent := <-cl.listenerOpChan:
 			{
 				switch levent.Op {
@@ -291,13 +379,13 @@ func (cl *Cluster) recvMessages() {
 					}
 				}
 			}
-		case <-cl.shutdown:
-			return
 		case message := <-cl.messages:
-			cl.logger.Debug("Received message", zap.Any("message", &message))
 			for _, listener := range listeners {
 				if listener.Predicate(message) {
-					listener.Listener(message)
+					err := listener.Listener(message)
+					if err != nil {
+						log.Error().Err(err).Msg("Error processing message")
+					}
 				}
 			}
 		}

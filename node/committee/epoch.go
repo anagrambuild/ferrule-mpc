@@ -1,4 +1,4 @@
-package comittee
+package committee
 
 type Epoch struct {
 	Proof []byte `json:"proof"`
@@ -14,14 +14,18 @@ type OpBlockEpochSource struct {
 	epoch *Epoch
 }
 
-func (o *OpBlockEpochSource) Epoch() *Epoch {
+func (o OpBlockEpochSource) Epoch() *Epoch {
 	return o.epoch
+}
+
+func (o OpBlockEpochSource) Expired(epoch *Epoch) bool {
+	return false
 }
 
 func NewOpBlockEpochSource(
 	opUrl string,
-) *OpBlockEpochSource {
-	return &OpBlockEpochSource{}
+) OpBlockEpochSource {
+	return OpBlockEpochSource{}
 }
 
 func (o *OpBlockEpochSource) Start() {

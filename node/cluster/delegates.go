@@ -4,20 +4,14 @@ import (
 	"sync"
 
 	"github.com/anagrambuild/ferrule/schemas"
+	"github.com/anagrambuild/ferrule/util"
 	"github.com/hashicorp/memberlist"
 	"go.uber.org/zap"
 )
-
 type state struct {
 	data   []byte
 	rwLock sync.RWMutex
 }
-
-type atomicNodeMap struct {
-	nm     map[string]*memberlist.Node
-	rwlock sync.RWMutex
-}
-
 type ClusterOperator struct {
 	memberlist.Delegate
 	memberlist.EventDelegate
@@ -30,7 +24,7 @@ type ClusterOperator struct {
 	nodeMeta     state
 	localState   state
 	logger       *zap.Logger
-	nodeMap      atomicNodeMap
+	nodeMap      util.SyncedMap[string, *memberlist.Node]
 }
 
 func NewClusterOperator(
@@ -49,12 +43,9 @@ func NewClusterOperator(
 			data:   []byte{},
 			rwLock: sync.RWMutex{},
 		},
-		nodeMap: atomicNodeMap{
-			nm:     map[string]*memberlist.Node{},
-			rwlock: sync.RWMutex{},
-		},
+		nodeMap: util.NewSyncedMap[string, *memberlist.Node](),
 	}
-	config := memberlist.DefaultLocalConfig()
+	config := memberlist.DefaultWANConfig()
 	config.Delegate = dlg
 	config.Name = selfName
 	config.Events = dlg
@@ -76,45 +67,28 @@ func (d *ClusterOperator) Shutdown() {
 }
 
 func (d *ClusterOperator) NotifyJoin(node *memberlist.Node) {
-	d.nodeMap.rwlock.Lock()
-	d.nodeMap.nm[node.Name] = node
 	d.memberEvents <- memberlist.NodeEvent{
 		Node:  node,
 		Event: memberlist.NodeJoin,
 	}
-	d.nodeMap.rwlock.Unlock()
 }
 
 func (d *ClusterOperator) NotifyLeave(node *memberlist.Node) {
-	d.nodeMap.rwlock.Lock()
-	delete(d.nodeMap.nm, node.Name)
 	d.memberEvents <- memberlist.NodeEvent{
 		Node:  node,
 		Event: memberlist.NodeLeave,
 	}
-	d.nodeMap.rwlock.Unlock()
 }
 
 func (d *ClusterOperator) NotifyUpdate(node *memberlist.Node) {
-	d.nodeMap.rwlock.Lock()
-	d.nodeMap.nm[node.Name] = node
 	d.memberEvents <- memberlist.NodeEvent{
 		Node:  node,
 		Event: memberlist.NodeUpdate,
 	}
-	d.nodeMap.rwlock.Unlock()
 }
 
 func (d *ClusterOperator) GetNode(name string) *memberlist.Node {
-	d.nodeMap.rwlock.RLock()
-	defer d.nodeMap.rwlock.RUnlock()
-	return d.nodeMap.nm[name]
-}
-
-func (d *ClusterOperator) GetNodeMap() *map[string]*memberlist.Node {
-	d.nodeMap.rwlock.RLock()
-	defer d.nodeMap.rwlock.RUnlock()
-	return &d.nodeMap.nm
+	return d.nodeMap.Get(name)
 }
 
 func (d *ClusterOperator) Start() error {

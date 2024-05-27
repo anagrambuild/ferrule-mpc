@@ -1,11 +1,13 @@
 package schemas
 
 import (
-	"crypto/ecdh"
 	"crypto/ecdsa"
+	"fmt"
 
 	"github.com/anagrambuild/ferrule/util"
 	ethcrypto "github.com/ethereum/go-ethereum/crypto"
+	"github.com/ethereum/go-ethereum/crypto/ecies"
+	"github.com/google/uuid"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -20,6 +22,7 @@ func EncodeClusterMessage(m *ClusterMessage) ([]byte, error) {
 }
 
 func (m *ClusterMessage) EncodeContent() error {
+	m.Id = []byte(uuid.New().String())
 	content, err := proto.Marshal(m.ParsedContent)
 	if err != nil {
 		return err
@@ -38,19 +41,28 @@ func (m *ClusterMessage) Sign(
 		return err
 	}
 	m.Signature = sig
+	m.From = util.PubKeyToNodeName(&key.PublicKey)
 	return nil
 }
 
 func (m *ClusterMessage) GetFromKey() (*ecdsa.PublicKey, error) {
-	return ethcrypto.UnmarshalPubkey(m.From)
+	return util.NodeNameToPubKey(m.From)
 }
 
-func (m *ClusterMessage) GetFromEcdh() (*ecdh.PublicKey, error) {
+func (m *ClusterMessage) GetFromEcies() (*ecies.PublicKey, error) {
 	key, err := m.GetFromKey()
 	if err != nil {
 		return nil, err
 	}
-	return key.ECDH()
+	return ecies.ImportECDSAPublic(key), nil
+}
+
+func (m *ClusterMessage) GetFromAddress() (string, error) {
+	nodeKey, err := m.GetFromKey()
+	if err != nil {
+		return "", err
+	}
+	return ethcrypto.PubkeyToAddress(*nodeKey).Hex(), nil
 }
 
 func (m *ClusterMessage) Verify(
@@ -66,7 +78,9 @@ func (m *ClusterMessage) Verify(
 
 func (m *ClusterMessage) VerifySelf() bool {
 	key, err := m.GetFromKey()
+	fmt.Println(key)
 	if err != nil {
+		fmt.Println("error getting key", err)
 		return false
 	}
 	return m.Verify(key)
@@ -84,13 +98,14 @@ func (m *ClusterMessage) DecodeContent() error {
 }
 
 func (m *ClusterMessage) Decrypt(
-	key *ecdh.PrivateKey,
+	key *ecies.PrivateKey,
 ) error {
-	pubEc, err := m.GetFromEcdh()
+	pubEc, err := m.GetFromEcies()
 	if err != nil {
 		return err
 	}
-	secret, err := key.ECDH(pubEc)
+	params := key.Params
+	secret, err := key.GenerateShared(pubEc, params.KeyLen, params.KeyLen)
 	if err != nil {
 		return err
 	}
@@ -108,5 +123,29 @@ func (m *ClusterMessage) Decrypt(
 	}
 	m.Content = content
 	m.DecodeContent()
+	return nil
+}
+
+func (m *ClusterMessage) Encrypt(
+	ecdsaKey *ecdsa.PrivateKey,
+	key *ecies.PrivateKey,
+	to *ecies.PublicKey,
+) error {
+	params := key.Params
+	secret, err := key.GenerateShared(to, params.KeyLen, params.KeyLen)
+	if err != nil {
+		return err
+	}
+	dk, err := util.DeriveSymKey(secret, m.Salt)
+	if err != nil {
+		return err
+	}
+	seal, err := util.EncryptMessage(dk, m.GetContent())
+	if err != nil {
+		return err
+	}
+	m.Nonce = seal.Nonce
+	m.Content = seal.Cipher
+	m.From = util.PubKeyToNodeName(&ecdsaKey.PublicKey)
 	return nil
 }

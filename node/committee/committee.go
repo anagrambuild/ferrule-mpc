@@ -1,29 +1,35 @@
-package comittee
+package committee
 
 import (
+	"crypto/ecdsa"
 	"encoding/json"
 	"fmt"
+	"math/big"
 	"os"
-	"slices"
 	"time"
 
 	"github.com/anagrambuild/ferrule/cluster"
 	"github.com/anagrambuild/ferrule/config"
+	"github.com/anagrambuild/ferrule/contracts"
 	"github.com/anagrambuild/ferrule/schemas"
 	"github.com/anagrambuild/ferrule/util"
 	"github.com/bnb-chain/tss-lib/v2/ecdsa/keygen"
 	"github.com/bnb-chain/tss-lib/v2/tss"
+	"github.com/ethereum/go-ethereum/common"
 	ethcrypto "github.com/ethereum/go-ethereum/crypto"
+	"github.com/ethereum/go-ethereum/ethclient"
 	"github.com/hashicorp/memberlist"
 	"github.com/oleiade/lane/v2"
+	"github.com/rs/zerolog/log"
 	"go.uber.org/zap"
 )
 
 type comitteeState struct {
-	Genesis     []byte                     `json:"genesis"`
-	SecretShare *keygen.LocalPartySaveData `json:"secretShare"`
-	EpochStart  *Epoch                     `json:"epochStart"`
-	CurrentParties []*tss.PartyID           `json:"currentParties"`
+	Genesis        []byte                     `json:"genesis"`
+	SecretShare    *keygen.LocalPartySaveData `json:"secretShare"`
+	EpochStart     *Epoch                     `json:"epochStart"`
+	CurrentParties []*tss.PartyID             `json:"currentParties"`
+	SharedPubKey   *ecdsa.PublicKey           `json:"sharedPubKey"`
 }
 
 type NodeLabel string
@@ -43,14 +49,14 @@ type Committee struct {
 	keygenCurrentParties []*tss.PartyID
 	keyGenInProgress     bool
 	selfId               *tss.PartyID
-	parties              *util.SyncedMap[string, *tss.PartyID]
-	nodeLabels           *util.SyncedMap[NodeLabel, util.Set[string]]
-	logger               *zap.Logger
+	parties              util.SyncedMap[string, *tss.PartyID]
+	nodeLabels           util.SyncedMap[NodeLabel, util.Set[string]]
 	keyGenMsgQueue       map[uint32]*lane.Queue[*schemas.KeygenMessage]
 	epochSource          EpochSource
 	forkThreshold        int
 	stateSaveLocation    string
 	shutdown             chan struct{}
+	ethConnection        *ethclient.Client
 }
 
 func NewCommittee(
@@ -68,30 +74,41 @@ func NewCommittee(
 			logger.Error("Error loading current secret share", zap.Error(err))
 		}
 	}
-
-	parties := util.NewSyncedMap[string, *tss.PartyID]()
-	nodeLabels := util.NewSyncedMap[NodeLabel, util.Set[string]]()
-	for _, label := range LabelTypes {
-		nodeLabels.Set(label, util.NewSet[string]())
-	}
-
-	return &Committee{
+	c := &Committee{
 		cluster:           cluster,
 		currentState:      cs,
-		logger:            logger,
-		selfId:            tss.NewPartyID(cfg.Address, cfg.Address, util.PubkeyToBigInt(&cfg.Identity.PublicKey)),
-		parties:           &parties,
+		selfId:            tss.NewPartyID(cfg.NodeName, cfg.NodeName, util.PubkeyToBigInt(&cfg.Identity.PublicKey)),
+		parties:           util.NewSyncedMap[string, *tss.PartyID](),
 		epochSource:       epochSource,
-		nodeLabels:        &nodeLabels,
+		nodeLabels:        util.NewSyncedMap[NodeLabel, util.Set[string]](),
 		forkThreshold:     max(3, cfg.ForkThreshold),
 		stateSaveLocation: cfg.CommitteeStateFile,
 		keyGenMsgQueue:    make(map[uint32]*lane.Queue[*schemas.KeygenMessage]),
 		shutdown:          make(chan struct{}),
+		ethConnection:     cfg.OpClient,
 	}
+	for _, label := range LabelTypes {
+		c.nodeLabels.Set(label, util.NewSet[string]())
+	}
+	return c
 }
 
 func (c *Committee) Shutdown() {
 	close(c.shutdown)
+}
+
+func (c *Committee) ReadFid() (*big.Int, error) {
+	addr := common.HexToAddress(contracts.ID_REGISTRY_ADDRESS)
+	caller, err := contracts.NewIdRegistryCaller(addr, c.ethConnection)
+	if err != nil {
+		return nil, err
+	}
+	selfAddr := ethcrypto.PubkeyToAddress(*c.currentState.SharedPubKey)
+	fid, err := caller.IdOf(nil, selfAddr)
+	if err != nil {
+		return nil, err
+	}
+	return fid, nil
 }
 
 func (c *Committee) StartKeygen(
@@ -101,16 +118,24 @@ func (c *Committee) StartKeygen(
 	c.keyGenInProgress = true
 	c.keygenSessionId = sessionId
 	c.keygenCurrentParties = parties
-	c.logger.Info("Starting keygen")
-	preParams, _ := keygen.GeneratePreParams(1 * time.Minute)
+	log.Debug().Msg("Starting keygen")
+	preParams, err := keygen.GeneratePreParams(1 * time.Minute)
+	if err != nil {
+		log.Error().Err(err).Msg("Error generating pre-params")
+		c.keyGenInProgress = false
+		c.keygenSessionId = ""
+		c.keygenCurrentParties = nil
+		return
+	}
 	curve := tss.S256()
 	sortedParties := tss.SortPartyIDs(parties)
-	fmt.Println(sortedParties)
 	pctx := tss.NewPeerContext(sortedParties)
 	outCh := make(chan tss.Message)
 	endCh := make(chan *keygen.LocalPartySaveData)
 	errCh := make(chan error)
-	parameters := tss.NewParameters(curve, pctx, c.selfId, len(sortedParties), c.forkThreshold)
+	t := max(2, len(sortedParties)/3)
+	log.Debug().Int("len", sortedParties.Len()).Any("parties", sortedParties).Msg("Synced parties")
+	parameters := tss.NewParameters(curve, pctx, c.selfId, len(sortedParties), t)
 	localParty := keygen.NewLocalParty(parameters, outCh, endCh, *preParams)
 
 	go func() {
@@ -135,7 +160,7 @@ func (c *Committee) StartKeygen(
 			}
 		case err := <-errCh:
 			{
-				c.logger.Error("Error starting keygen", zap.Error(err))
+				log.Error().Err(err).Msg("Error starting keygen")
 				close(outCh)
 				close(endCh)
 				close(errCh)
@@ -143,7 +168,9 @@ func (c *Committee) StartKeygen(
 			}
 		case msg := <-outCh:
 			{
-				c.logger.Info("Sending message", zap.String("msg", msg.String()))
+				log.Debug().
+					Any("msg", msg).
+					Msg("Sending keygen message")
 
 			}
 			break
@@ -201,17 +228,21 @@ func (c *Committee) StartKeygen(
 			break
 		case data := <-endCh:
 			{
-				c.logger.Info("Keygen complete")
+				log.Info().Msg("Keygen completed")
 				c.currentState.SecretShare = data
+				c.keyGenInProgress = false
+				c.keygenSessionId = ""
+				c.keygenCurrentParties = nil
 				//save current state to disk
 				data, err := json.Marshal(c.currentState)
 				if err != nil {
-					c.logger.Error("Error saving current state", zap.Error(err))
+					log.Error().Err(err).Msg("Error marshalling save data")
 					errCh <- err
 				} else {
 					err := os.WriteFile(c.stateSaveLocation, data, 0644)
 					if err != nil {
-						c.logger.Error("Error saving current state", zap.Error(err))
+						log.Error().Err(err).Msg("Error saving current state")
+						errCh <- err
 					}
 				}
 
@@ -222,8 +253,9 @@ func (c *Committee) StartKeygen(
 }
 
 func nodeToPartyId(node *memberlist.Node) *tss.PartyID {
-	pk, err := ethcrypto.UnmarshalPubkey([]byte(node.Name))
+	pk, err := util.NodeNameToPubKey(node.Name)
 	if err != nil {
+		log.Error().Err(err).Msg("Error getting pubkey from node")
 		return nil
 	}
 	return tss.NewPartyID(node.Name, node.Name, util.PubkeyToBigInt(pk))
@@ -237,14 +269,12 @@ func (c *Committee) syncParties() {
 			newMap[node.Name] = nodeToPartyId(node)
 		}
 	}
+	newMap[c.cluster.SelfNode().Name] = c.selfId
 	c.parties.Replace(newMap)
 }
 
 func (c *Committee) shouldProposeKeygen() bool {
-	if c.currentState == nil ||
-		c.currentState.EpochStart == nil ||
-		c.epochSource.Expired(c.currentState.EpochStart) ||
-		c.currentState.SecretShare == nil {
+	if c.parties.Len() >= c.forkThreshold && (c.currentState == nil || c.currentState.SecretShare == nil) && c.keyGenInProgress == false {
 		return true
 	}
 	return false
@@ -263,21 +293,31 @@ func sessionId(parties []*tss.PartyID) string {
 func stateHandler(c *Committee) {
 	for {
 		select {
+		case <-c.shutdown:
+			{
+				return
+			}
 		case <-time.After(5 * time.Second):
 			{
 				c.syncParties()
 				if c.shouldProposeKeygen() {
-					c.logger.Info("Proposing keygen")
+					log.Debug().Msg("Proposing keygen")
 					c.nodeLabels.Get(WantsKeygen).Add(c.cluster.SelfNode().Name)
-					c.cluster.Broadcast(&schemas.ClusterMessage{
-						ParsedContent: &schemas.Content{
-							Content: &schemas.Content_KeygenStart{
-								KeygenStart: &schemas.KeygenStart{
-									SessionID: c.keygenSessionId,
+					err := c.cluster.Broadcast(
+						&schemas.ClusterMessage{
+							ParsedContent: &schemas.Content{
+								Content: &schemas.Content_KeygenStart{
+									KeygenStart: &schemas.KeygenStart{
+										SessionID: c.keygenSessionId,
+									},
 								},
 							},
-						},
-					})
+						})
+					if err != nil {
+						log.Error().Err(err).Msg("Error broadcasting keygen proposal")
+					} else {
+						log.Info().Msg("Keygen proposal broadcasted")
+					}
 				}
 			}
 		}
@@ -285,6 +325,7 @@ func stateHandler(c *Committee) {
 }
 
 func (c *Committee) Start() {
+	log.Info().Msg("Starting committee")
 	c.cluster.AddEventListener(
 		&cluster.ClusterEventListener{
 			Id: "comittee-event",
@@ -292,37 +333,42 @@ func (c *Committee) Start() {
 				switch event.Event {
 				case memberlist.NodeJoin:
 					{
-						c.logger.Info("Node joined", zap.String("node", event.Node.Name))
 						c.parties.Set(event.Node.Name, nodeToPartyId(event.Node))
 					}
 				case memberlist.NodeLeave:
 					{
-						c.logger.Info("Node left", zap.String("node", event.Node.Name))
 						c.parties.Delete(event.Node.Name)
 					}
 				}
 			},
 		})
-
 	c.cluster.AddListener(&cluster.ClusterMessageListener{
 		Id: "comittee",
 		Predicate: func(message *schemas.ClusterMessage) bool {
-			types := []string{
-				"KeygenMessage",
-				"KeygenStart",
+			if message.ParsedContent == nil || message.ParsedContent.Content == nil {
+				log.Error().Msg("Invalid message, nil content")
+				return false
 			}
-			return slices.Contains(types, string(message.ParsedContent.ProtoReflect().Descriptor().Name()))
+			switch message.ParsedContent.Content.(type) {
+			case *schemas.Content_KeygenStart:
+				return true
+			case *schemas.Content_Keygen:
+				return true
+			}
+			return false
 		},
 		Listener: func(message *schemas.ClusterMessage) error {
-			switch message.ParsedContent.ProtoReflect().Descriptor().Name() {
-			case "KeygenStart":
+			switch message.ParsedContent.Content.(type) {
+			case *schemas.Content_KeygenStart:
 				{
-					c.nodeLabels.Get(WantsKeygen).Add(string(message.From))
+					log.Info().Msg("Keygen proposal recived")
+					c.nodeLabels.Get(WantsKeygen).Add(message.From)
 					if c.currentState == nil || c.epochSource.Expired(c.currentState.EpochStart) {
-						if proposingNodes := c.nodeLabels.Get(WantsKeygen); proposingNodes != nil && proposingNodes.Len() >= c.cluster.NumNodes()/c.forkThreshold {
-
+						if proposingNodes := c.nodeLabels.Get(WantsKeygen); proposingNodes != nil && proposingNodes.Len() >= c.forkThreshold {
+							log.Info().Any("nodes", proposingNodes.Items()).Msg("Keygen proposal accepted")
 							parties := []*tss.PartyID{}
-							for _,node := range c.nodeLabels.Get(WantsKeygen).Items() {
+							for _, node := range proposingNodes.Items() {
+								log.Debug().Str("node", node).Msg("Adding party")
 								if party := c.parties.Get(node); party != nil {
 									parties = append(parties, party)
 								}
@@ -334,28 +380,28 @@ func (c *Committee) Start() {
 							)
 						}
 					} else {
-						c.logger.Info("Keygen proposal recived, rejected but stored for later")
+						log.Debug().Msg("Keygen proposal rejected, but saved")
 						c.nodeLabels.Get(WantsKeygen).Add(string(message.From))
 					}
 				}
 				break
-			case "KeygenMessage":
+			case *schemas.Content_Keygen:
 				{
 					msg := message.GetParsedContent().GetKeygen()
 					if msg == nil {
-						c.logger.Error("Invalid keygen message")
+						log.Error().Msg("Invalid keygen message")
 						break
 					}
-					c.logger.Info("Keygen message recived")
 					if pa := c.parties.Get(string(message.From)); pa != nil {
-						c.logger.Info("Keygen message recived from committee member", zap.String("from", string(message.From)), zap.String("round", message.String()))
+						log.Info().Str("from", string(message.From)).Msg("Keygen message recived")
+
 						if c.keyGenMsgQueue[msg.Round] == nil {
 							q := lane.NewQueue[*schemas.KeygenMessage]()
 							c.keyGenMsgQueue[msg.Round] = q
 						}
 						c.keyGenMsgQueue[msg.Round].Enqueue(msg)
 					} else {
-						fmt.Println("not in committee")
+						log.Error().Str("from", string(message.From)).Msg("Proposed keygen from non-comittee party")
 					}
 				}
 				break
@@ -364,4 +410,5 @@ func (c *Committee) Start() {
 		},
 	})
 	// Start the committee
+	go stateHandler(c)
 }

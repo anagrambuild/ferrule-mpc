@@ -31,7 +31,7 @@ message Content {
 message ClusterMessage {
   bytes id = 1;
   optional bytes signature = 2;
-  bytes from = 3;
+  string from = 3;
   bool encrypted = 4;
   optional bytes salt = 5;
   optional bytes nonce = 6;
