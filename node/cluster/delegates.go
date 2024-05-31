@@ -8,6 +8,7 @@ import (
 	"github.com/hashicorp/memberlist"
 	"go.uber.org/zap"
 )
+
 type state struct {
 	data   []byte
 	rwLock sync.RWMutex
@@ -67,6 +68,7 @@ func (d *ClusterOperator) Shutdown() {
 }
 
 func (d *ClusterOperator) NotifyJoin(node *memberlist.Node) {
+	d.nodeMap.Set(node.Name, node)
 	d.memberEvents <- memberlist.NodeEvent{
 		Node:  node,
 		Event: memberlist.NodeJoin,
@@ -74,6 +76,7 @@ func (d *ClusterOperator) NotifyJoin(node *memberlist.Node) {
 }
 
 func (d *ClusterOperator) NotifyLeave(node *memberlist.Node) {
+	d.nodeMap.Delete(node.Name)
 	d.memberEvents <- memberlist.NodeEvent{
 		Node:  node,
 		Event: memberlist.NodeLeave,
@@ -81,6 +84,7 @@ func (d *ClusterOperator) NotifyLeave(node *memberlist.Node) {
 }
 
 func (d *ClusterOperator) NotifyUpdate(node *memberlist.Node) {
+	d.nodeMap.Set(node.Name, node)
 	d.memberEvents <- memberlist.NodeEvent{
 		Node:  node,
 		Event: memberlist.NodeUpdate,

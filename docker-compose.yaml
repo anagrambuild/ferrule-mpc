@@ -10,6 +10,8 @@ services:
     expose:
       - 7946/udp
       - 7946/tcp
+    env_file:
+      - ./.env
     environment:
       - FR_IDENTITY_KEY_PATH=/app/node.key
       - FR_LOG_LEVEL=debug
@@ -30,6 +32,8 @@ services:
       - 7946/tcp
     ports:
       - 9000:9000
+    env_file:
+      - ./.env
     environment:
       - FR_IDENTITY_KEY_PATH=/app/node2.key
       - FR_LOG_LEVEL=debug
@@ -51,6 +55,8 @@ services:
       - 7946/tcp
     ports:
       - 9002:9000
+    env_file:
+      - ./.env
     environment:
       - FR_IDENTITY_KEY_PATH=/app/node3.key
       - FR_LOG_LEVEL=debug

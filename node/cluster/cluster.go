@@ -182,6 +182,10 @@ func (cl *Cluster) Broadcast(message *schemas.ClusterMessage) error {
 	if err != nil {
 		return err
 	}
+
+	if message.Encrypted {
+		message.Encrypted = false
+	}
 	err = message.Sign(cl.self.Identity)
 	if err != nil {
 		return err
@@ -191,7 +195,6 @@ func (cl *Cluster) Broadcast(message *schemas.ClusterMessage) error {
 		fmt.Println("error validating message", err)
 		return err
 	}
-	log.Debug().Any("message", message).Msg("Broadcasting message")
 	bts, err := schemas.EncodeClusterMessage(message)
 	if err != nil {
 		return err
@@ -255,6 +258,8 @@ func (cl *Cluster) SelfNode() *memberlist.Node {
 }
 
 func (cl *Cluster) LookupNode(name string) *memberlist.Node {
+	log.Debug().Str("name", name).Msg("Looking up node")
+	log.Debug().Str("nodes", fmt.Sprintf("%+v", cl.operator.nodeMap.Items())).Msg("Nodes")
 	return cl.operator.GetNode(name)
 }
 

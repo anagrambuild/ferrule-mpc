@@ -1,2 +1,4 @@
 focus/tmp
 nodedata
+.env
+node/tmp
