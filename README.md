@@ -10,7 +10,7 @@ The cluster is leader less and uses a threshold signature scheme to sign transac
 
 ## Goals
 
-- Make it eaiser to deploy decentrzlized Farcaster apps
+- Make it eaiser to deploy decentralized Farcaster apps
 - Be the foundational signer technology for Ferrule (the Farcaster Hub AVS)
 - Leaderless consensus
 
