@@ -1,11 +1,12 @@
 package committee
 
 import (
+	"context"
 	"crypto/ecdsa"
 	"encoding/json"
-	"fmt"
 	"math/big"
 	"os"
+	"path"
 	"time"
 
 	"github.com/anagrambuild/ferrule/cluster"
@@ -21,15 +22,19 @@ import (
 	"github.com/hashicorp/memberlist"
 	"github.com/oleiade/lane/v2"
 	"github.com/rs/zerolog/log"
-	"go.uber.org/zap"
 )
 
 type comitteeState struct {
-	Genesis        []byte                     `json:"genesis"`
-	SecretShare    *keygen.LocalPartySaveData `json:"secretShare"`
-	EpochStart     *Epoch                     `json:"epochStart"`
-	CurrentParties []*tss.PartyID             `json:"currentParties"`
-	SharedPubKey   *ecdsa.PublicKey           `json:"sharedPubKey"`
+	Genesis        []byte                     `json:"genesis,omitempty"`
+	SecretShare    *keygen.LocalPartySaveData `json:"secretShare,omitempty"`
+	EpochStart     *Epoch                     `json:"epochStart,omitempty"`
+	CurrentParties []*tss.PartyID             `json:"currentParties,omitempty"`
+}
+
+type keygenUpdate struct {
+	From    *tss.PartyID
+	To      *tss.PartyID
+	Message *schemas.KeygenMessage
 }
 
 type NodeLabel string
@@ -50,8 +55,9 @@ type Committee struct {
 	keyGenInProgress     bool
 	selfId               *tss.PartyID
 	parties              util.SyncedMap[string, *tss.PartyID]
+	currentCommittee     util.SyncedMap[string, *tss.PartyID]
 	nodeLabels           util.SyncedMap[NodeLabel, util.Set[string]]
-	keyGenMsgQueue       map[uint32]*lane.Queue[*schemas.KeygenMessage]
+	keyGenMsgQueue       util.SyncedMap[uint32, *lane.Queue[*keygenUpdate]]
 	epochSource          EpochSource
 	forkThreshold        int
 	stateSaveLocation    string
@@ -64,26 +70,26 @@ func NewCommittee(
 	cluster *cluster.Cluster,
 	epochSource EpochSource,
 ) *Committee {
-	logger, _ := zap.NewProduction()
-	var cs *comitteeState
+
+	var cs comitteeState
 	if cfg.CurrentSecretShare != nil && len(cfg.CurrentSecretShare) > 0 {
-		err := json.Unmarshal(cfg.CurrentSecretShare, cs)
+		err := json.Unmarshal(cfg.CurrentSecretShare, &cs)
 		if err == nil {
-			logger.Info("Loaded current secret share")
+			log.Info().Msg("Loaded current secret share")
 		} else {
-			logger.Error("Error loading current secret share", zap.Error(err))
+			log.Error().Err(err).Msg("Failed to load current secret share")
 		}
 	}
 	c := &Committee{
 		cluster:           cluster,
-		currentState:      cs,
+		currentState:      &cs,
 		selfId:            tss.NewPartyID(cfg.NodeName, cfg.NodeName, util.PubkeyToBigInt(&cfg.Identity.PublicKey)),
 		parties:           util.NewSyncedMap[string, *tss.PartyID](),
 		epochSource:       epochSource,
 		nodeLabels:        util.NewSyncedMap[NodeLabel, util.Set[string]](),
 		forkThreshold:     max(2, cfg.ForkThreshold),
 		stateSaveLocation: cfg.CommitteeStateFile,
-		keyGenMsgQueue:    make(map[uint32]*lane.Queue[*schemas.KeygenMessage]),
+		keyGenMsgQueue:    util.NewSyncedMap[uint32, *lane.Queue[*keygenUpdate]](),
 		shutdown:          make(chan struct{}),
 		ethConnection:     cfg.OpClient,
 	}
@@ -91,6 +97,13 @@ func NewCommittee(
 		c.nodeLabels.Set(label, util.NewSet[string]())
 	}
 	return c
+}
+
+func (c *Committee) SharedPubKey() *ecdsa.PublicKey {
+	if c.currentState == nil || c.currentState.SecretShare == nil {
+		return nil
+	}
+	return c.currentState.SecretShare.ECDSAPub.ToECDSAPubKey()
 }
 
 func (c *Committee) Shutdown() {
@@ -103,7 +116,7 @@ func (c *Committee) ReadFid() (*big.Int, error) {
 	if err != nil {
 		return nil, err
 	}
-	selfAddr := ethcrypto.PubkeyToAddress(*c.currentState.SharedPubKey)
+	selfAddr := ethcrypto.PubkeyToAddress(*c.SharedPubKey())
 	fid, err := caller.IdOf(nil, selfAddr)
 	if err != nil {
 		return nil, err
@@ -125,6 +138,7 @@ func (c *Committee) EndKeygen(
 }
 
 func (c *Committee) StartKeygen(
+	ctx context.Context,
 	sessionId string,
 	parties []*tss.PartyID,
 ) {
@@ -153,29 +167,93 @@ func (c *Committee) StartKeygen(
 	go func() {
 		err := localParty.Start()
 		if err != nil {
+			log.Error().Err(err).Msg("Error starting keygen local party")
 			errCh <- err
 		}
 	}()
 
-	roundPartySignoff := map[uint32]map[string]bool{}
-	currentRound := uint32(1)
-	processing := false
+	go func() {
+		roundPartySignoff := map[uint32]map[string]bool{}
+		currentRound := uint32(1)
+		processing := false
+		for {
+			select {
+			case <-ctx.Done():
+			case <-c.shutdown:
+			case <-errCh:
+				return
+			case <-time.After(time.Second * 5):
+				{
+					if currentRound == 4 {
+						break
+					}
+					cq := c.keyGenMsgQueue.Get(currentRound)
+					if cq == nil || processing {
+						break
+					}
+
+					if cq.Size() > 0 {
+						log.Debug().Msg("Starting keygen message processing")
+
+						kmsg, ok := cq.Dequeue()
+						log.Debug().Uint32("round", currentRound).Uint32("message round", kmsg.Message.Round).Msg("Processing keygen message")
+						if roundPartySignoff[currentRound] == nil {
+							roundPartySignoff[currentRound] = make(map[string]bool)
+						}
+						roundPartySignoff[currentRound][kmsg.From.Id] = true
+						if ok {
+							processing = true
+							ok, err := localParty.UpdateFromBytes(kmsg.Message.Payload, kmsg.From, kmsg.Message.IsBroadcast)
+							if err != nil {
+								log.Error().Err(err).Msg("Error updating keygen")
+							}
+
+							if !ok {
+								log.Error().Msg("Keygen update not okay")
+							}
+							log.Debug().Msg("Updated keygen")
+							processing = false
+						}
+					}
+					if cq.Size() == 0 {
+						moveToNextRound := true
+
+						for _, party := range parties {
+							if party.Id == c.selfId.Id {
+								continue
+							}
+							if k, ok := roundPartySignoff[currentRound][party.Id]; !k || !ok {
+								moveToNextRound = false
+								break
+							}
+						}
+						if moveToNextRound {
+							currentRound += 1
+						}
+					}
+
+				}
+				break
+			}
+		}
+	}()
 
 	for {
 		select {
+		case <-ctx.Done():
+			{
+				c.EndKeygen(errCh, outCh, endCh)
+				return
+			}
 		case <-c.shutdown:
 			{
-				close(outCh)
-				close(endCh)
-				close(errCh)
+				c.EndKeygen(errCh, outCh, endCh)
 				return
 			}
 		case err := <-errCh:
 			{
-				log.Error().Err(err).Msg("Error starting keygen")
-				close(outCh)
-				close(endCh)
-				close(errCh)
+				log.Error().Err(err).Msg("Error in keygen")
+				c.EndKeygen(errCh, outCh, endCh)
 				return
 			}
 		case msg := <-outCh:
@@ -186,152 +264,70 @@ func (c *Committee) StartKeygen(
 						log.Error().Err(err).Msg("Error getting wire bytes")
 						break
 					}
-
-					if msg.IsBroadcast() {
-						log.Debug().Any("parties", c.keygenCurrentParties).Msg("Sending keygen broadcast message")
-						//to big for gossip
-						for _, to := range c.keygenCurrentParties {
-							wireMessage := schemas.ClusterMessage{
-								ParsedContent: &schemas.Content{
-									Content: &schemas.Content_Keygen{
-										Keygen: &schemas.KeygenMessage{
-											From:        []byte(c.selfId.Id),
-											IsBroadcast: false,
-											SessionID:   sessionId,
-											Payload:     bytes,
-											Round:       currentRound,
-										},
+					toParties := msg.GetTo()
+					if toParties == nil {
+						toParties = c.keygenCurrentParties
+					}
+					for _, to := range toParties {
+						wireMessage := schemas.ClusterMessage{
+							ParsedContent: &schemas.Content{
+								Content: &schemas.Content_Keygen{
+									Keygen: &schemas.KeygenMessage{
+										IsBroadcast: msg.IsBroadcast(),
+										SessionID:   sessionId,
+										Payload:     bytes,
+										Round:       util.GetRound(msg.Type()),
 									},
 								},
-							}
-							if toNode := c.cluster.LookupNode(to.Id); toNode != nil {
-								log.Debug().Msg("Sending keygen broadcast message")
-								err := c.cluster.SendToNode(toNode, &wireMessage)
-								if err != nil {
-
-									log.Error().Err(err).Msg("Error sending keygen message")
-								}
-							} else {
-								log.Error().Msg("Node not found, or has left since keygen started")
-								//end keygen
-								if sortedParties.Len()-1 < t {
-									c.EndKeygen(errCh, outCh, endCh)
-									return
-								}
-							}
+							},
 						}
-					} else {
-						log.Debug().Any("parties", msg.GetTo()).Msg("Sending keygen message")
-						for _, to := range msg.GetTo() {
-							wireMessage := schemas.ClusterMessage{
-								ParsedContent: &schemas.Content{
-									Content: &schemas.Content_Keygen{
-										Keygen: &schemas.KeygenMessage{
-											From:        []byte(c.selfId.Id),
-											IsBroadcast: false,
-											SessionID:   sessionId,
-											Payload:     bytes,
-											Round:       currentRound,
-										},
-									},
-								},
-							}
-							if toNode := c.cluster.LookupNode(to.Id); toNode != nil {
-								log.Debug().Msg("Sending keygen message")
-								err := c.cluster.SendToNodeEncrypted(toNode, &wireMessage)
-								if err != nil {
-									log.Error().Err(err).Msg("Error sending keygen message")
-								}
-							} else {
-								log.Error().Msg("Node not found, or has left since keygen started")
-								//end keygen
-								if sortedParties.Len()-1 < t {
-									c.EndKeygen(errCh, outCh, endCh)
-									return
-								}
-							}
-
-						}
-					}
-
-				}
-			}
-			break
-		case <-time.After(time.Second * 10):
-			{
-				log.Debug().Any("parties ", localParty.WaitingFor()).Msg("Keygen waiting")
-
-				if currentRound == 4 {
-					break
-				}
-
-				if c.keyGenMsgQueue[currentRound] == nil || processing {
-					continue
-				}
-
-				if c.keyGenMsgQueue[currentRound].Size() > 0 {
-					kmsg, ok := c.keyGenMsgQueue[currentRound].Dequeue()
-					pid := string(kmsg.From)
-					if roundPartySignoff[currentRound] == nil {
-						roundPartySignoff[currentRound] = make(map[string]bool)
-					}
-					roundPartySignoff[currentRound][pid] = true
-					if ok {
-						if c := c.parties.Get(pid); c != nil {
-							processing = true
-							ok, err := localParty.UpdateFromBytes(kmsg.Payload, c, kmsg.IsBroadcast)
+						if toNode := c.cluster.LookupNode(to.Id); toNode != nil {
+							log.Debug().Msg("Sending keygen message")
+							err := c.cluster.SendToNode(toNode, &wireMessage)
 							if err != nil {
-								log.Error().Err(err).Msg("Error updating keygen")
+								log.Error().Err(err).Msg("Error sending keygen message")
 							}
-							if !ok {
-								log.Error().Msg("Keygen update not okay")
+						} else {
+							log.Error().Msg("Node not found, or has left since keygen started")
+							//end keygen
+							if sortedParties.Len()-1 < t {
+								c.EndKeygen(errCh, outCh, endCh)
+								return
 							}
-							processing = false
 						}
 					}
 				}
-				if c.keyGenMsgQueue[currentRound].Size() == 0 {
-					moveToNextRound := true
-
-					for _, party := range parties {
-						if party.Id == c.selfId.Id {
-							continue
-						}
-						if k, ok := roundPartySignoff[currentRound][party.Id]; !k || !ok {
-							moveToNextRound = false
-							break
-						}
-					}
-					fmt.Println("signoff", roundPartySignoff)
-					if moveToNextRound {
-						currentRound += 1
-					}
-				}
-
 			}
 			break
 		case data := <-endCh:
 			{
+
 				log.Info().Msg("Keygen completed")
-				c.currentState.SecretShare = data
-				c.keyGenInProgress = false
-				c.keygenSessionId = ""
-				c.keygenCurrentParties = nil
+				c.currentState = &comitteeState{
+					CurrentParties: c.keygenCurrentParties,
+					SecretShare:    data,
+				}
 				//save current state to disk
 				data, err := json.Marshal(c.currentState)
 				if err != nil {
 					log.Error().Err(err).Msg("Error marshalling save data")
 					errCh <- err
 				} else {
-					err := os.WriteFile(c.stateSaveLocation, data, 0644)
+					err := os.MkdirAll(path.Dir(c.stateSaveLocation), 0755)
+					if err != nil {
+
+						log.Error().Err(err).Msg("Error creating directory for state save")
+					}
+
+					err = os.WriteFile(c.stateSaveLocation, data, 0644)
 					if err != nil {
 						log.Error().Err(err).Msg("Error saving current state")
 						errCh <- err
 					}
 				}
-
+				c.EndKeygen(errCh, outCh, endCh)
+				return
 			}
-			break
 		}
 	}
 }
@@ -345,7 +341,7 @@ func nodeToPartyId(node *memberlist.Node) *tss.PartyID {
 	return tss.NewPartyID(node.Name, node.Name, util.PubkeyToBigInt(pk))
 }
 
-func (c *Committee) syncParties() {
+func (c *Committee) loadParties() {
 	nodes := c.cluster.GetNodes()
 	newMap := make(map[string]*tss.PartyID)
 	for _, node := range nodes {
@@ -356,10 +352,18 @@ func (c *Committee) syncParties() {
 	newMap[c.cluster.SelfNode().Name] = c.selfId
 	c.parties.Replace(newMap)
 }
+func (c *Committee) saveCommittee() {
+	newMap := make(map[string]*tss.PartyID)
+	nodes := c.parties.Items()
+	for _, node := range nodes {
+		newMap[node.Id] = node
+	}
+	c.currentCommittee.Replace(newMap)
+}
 
 func (c *Committee) shouldProposeKeygen() bool {
 	//add in epoch expiry
-	if c.keyGenInProgress == false && c.parties.Len() >= c.forkThreshold && c.currentState == nil {
+	if c.keyGenInProgress == false && c.parties.Len() >= c.forkThreshold && (c.currentState == nil || c.currentState.SecretShare == nil) {
 		return true
 	}
 	return false
@@ -384,7 +388,7 @@ func stateHandler(c *Committee) {
 			}
 		case <-time.After(5 * time.Second):
 			{
-				c.syncParties()
+				c.loadParties()
 				if c.shouldProposeKeygen() {
 					log.Debug().Msg("Proposing keygen")
 					c.nodeLabels.Get(WantsKeygen).Add(c.cluster.SelfNode().Name)
@@ -411,22 +415,7 @@ func stateHandler(c *Committee) {
 
 func (c *Committee) Start() {
 	log.Info().Msg("Starting committee")
-	c.cluster.AddEventListener(
-		&cluster.ClusterEventListener{
-			Id: "comittee-event",
-			Listener: func(event memberlist.NodeEvent) {
-				switch event.Event {
-				case memberlist.NodeJoin:
-					{
-						c.parties.Set(event.Node.Name, nodeToPartyId(event.Node))
-					}
-				case memberlist.NodeLeave:
-					{
-						c.parties.Delete(event.Node.Name)
-					}
-				}
-			},
-		})
+	
 	c.cluster.AddListener(&cluster.ClusterMessageListener{
 		Id: "comittee",
 		Predicate: func(message *schemas.ClusterMessage) bool {
@@ -443,6 +432,7 @@ func (c *Committee) Start() {
 			return false
 		},
 		Listener: func(message *schemas.ClusterMessage) error {
+
 			switch message.ParsedContent.Content.(type) {
 			case *schemas.Content_KeygenStart:
 				{
@@ -450,17 +440,18 @@ func (c *Committee) Start() {
 						log.Info().Msg("Keygen proposal recived")
 						c.nodeLabels.Get(WantsKeygen).Add(message.From)
 						// move to same logic as should propose keygen
-						if c.currentState == nil || c.epochSource.Expired(c.currentState.EpochStart) {
+						if c.currentState == nil || c.currentState.SecretShare == nil || c.epochSource.Expired(c.currentState.EpochStart) {
 							if proposingNodes := c.nodeLabels.Get(WantsKeygen); proposingNodes != nil && proposingNodes.Len() >= c.forkThreshold {
-								log.Info().Any("nodes", proposingNodes.Items()).Msg("Keygen proposal accepted")
 								parties := []*tss.PartyID{}
+								c.saveCommittee()
 								for _, node := range proposingNodes.Items() {
-									if party := c.parties.Get(node); party != nil {
+									if party := c.currentCommittee.Get(node); party != nil {
 										parties = append(parties, party)
 									}
 								}
-
+								ctxKg, _ := context.WithDeadline(context.Background(), time.Now().Add(5*time.Minute))
 								go c.StartKeygen(
+									ctxKg,
 									sessionId(parties),
 									parties,
 								)
@@ -474,22 +465,24 @@ func (c *Committee) Start() {
 				break
 			case *schemas.Content_Keygen:
 				{
-					log.Info().Msg("Keygen message recived")
 					if c.keyGenInProgress {
-						log.Debug().Str("from", string(message.From)).Msg("Keygen message recived")
 						msg := message.GetParsedContent().GetKeygen()
+						log.Debug().Uint32("round", msg.Round).Msg("processing message")
 						if msg == nil {
 							log.Error().Msg("Invalid keygen message")
-							break
 						}
-						if pa := c.parties.Get(string(message.From)); pa != nil {
-							log.Info().Str("from", string(message.From)).Msg("Keygen message recived")
-
-							if c.keyGenMsgQueue[msg.Round] == nil {
-								q := lane.NewQueue[*schemas.KeygenMessage]()
-								c.keyGenMsgQueue[msg.Round] = q
+						if pa := c.currentCommittee.Get(message.From); pa != nil {
+							cq := c.keyGenMsgQueue.Get(msg.Round)
+							if cq == nil {
+								q := lane.NewQueue[*keygenUpdate]()
+								c.keyGenMsgQueue.Set(msg.Round, q)
+								cq = c.keyGenMsgQueue.Get(msg.Round)
 							}
-							c.keyGenMsgQueue[msg.Round].Enqueue(msg)
+							cq.Enqueue(&keygenUpdate{
+								From:    pa,
+								To:      c.selfId,
+								Message: msg,
+							})
 						} else {
 							log.Error().Str("from", string(message.From)).Msg("Proposed keygen from non-comittee party")
 						}

@@ -3,10 +3,13 @@ package main
 import (
 	"os"
 	"os/signal"
+	"time"
 
 	"github.com/anagrambuild/ferrule/cluster"
 	"github.com/anagrambuild/ferrule/committee"
 	"github.com/anagrambuild/ferrule/util"
+	ethcrypto "github.com/ethereum/go-ethereum/crypto"
+	"github.com/rs/zerolog/log"
 )
 
 /*
@@ -36,11 +39,20 @@ func main() {
 	}
 	comittee := committee.NewCommittee(cfg, cluster, epochSource)
 	comittee.Start()
-
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Kill)
+
 	for {
 		select {
+		case <-time.After(10 * time.Second):
+			{
+				p := comittee.SharedPubKey()
+				if p == nil {
+					continue
+				}
+				log.Info().Interface("pubkey", ethcrypto.PubkeyToAddress(*p)).Msg("Current public key")
+				break
+			}
 		case <-sigChan:
 			comittee.Shutdown()
 			cluster.Shutdown()

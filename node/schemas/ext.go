@@ -2,11 +2,12 @@ package schemas
 
 import (
 	"crypto/ecdsa"
-	"fmt"
 
 	"github.com/anagrambuild/ferrule/util"
 	ethcrypto "github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/crypto/ecies"
+	"github.com/rs/zerolog/log"
+
 	"github.com/google/uuid"
 	"google.golang.org/protobuf/proto"
 )
@@ -78,9 +79,8 @@ func (m *ClusterMessage) Verify(
 
 func (m *ClusterMessage) VerifySelf() bool {
 	key, err := m.GetFromKey()
-	fmt.Println(key)
 	if err != nil {
-		fmt.Println("error getting key", err)
+		log.Error().Str("from", m.From).Err(err).Msg("failed to get from key")
 		return false
 	}
 	return m.Verify(key)

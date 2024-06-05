@@ -9,8 +9,10 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	"log"
 	"math/big"
 	"os"
+	"path"
 	"regexp"
 	"strconv"
 	"strings"
@@ -27,16 +29,17 @@ import (
 
 var roundRegex = regexp.MustCompile(`.+Round(\d{1}).+`)
 
-func GetRound(messageType string) int32 {
+func GetRound(messageType string) uint32 {
 	match := roundRegex.FindStringSubmatch(messageType)
 	if len(match) < 2 {
-		return -1
+		return 0
 	}
 	round, err := strconv.Atoi(match[1])
 	if err != nil {
-		return -1
+		return 0
 	}
-	return int32(round)
+	log.Printf("Round %d", round)
+	return uint32(round)
 }
 
 func LoadIdentity(path string) *ecdsa.PrivateKey {
@@ -88,7 +91,7 @@ func InitConfig() *config.FerruleConfig {
 		panic(err)
 	}
 	id := LoadIdentity(cfg.IdentityKpPath)
-	loc := cfg.SecretShareDir + "/current.json"
+	loc := path.Join(cfg.SecretShareDir, "current.json")
 	//todo peer encryption
 	return &config.FerruleConfig{
 		Identity:           id,

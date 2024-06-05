@@ -7,8 +7,6 @@ message KeygenStart {
 }
 
 message KeygenMessage {
-  bytes from = 1;
-  bytes to = 2;
   bool isBroadcast = 3;
   bytes payload = 4;
   uint32 round = 5;
@@ -38,4 +36,5 @@ message ClusterMessage {
   bytes content = 7;
   //dont use this on the wire - only for internal use
   optional Content parsedContent = 8;
+  optional string to = 9;
 }
